@@ -1,0 +1,6 @@
+torch
+transformers
+numpy
+peft
+accelerate
+huggingface-hub
