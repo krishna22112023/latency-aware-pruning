@@ -1,6 +1,15 @@
-torch
 transformers
 numpy
 peft
 accelerate
 huggingface-hub
+pyprojroot
+tiktoken
+blobfile
+sentencepiece
+protobuf
+pandas
+fire
+datasets
+pyprojroot
+bitsandbytes

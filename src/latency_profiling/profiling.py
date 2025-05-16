@@ -1,30 +1,37 @@
+import json
 import torch
 import time
+from tqdm import tqdm
 import numpy as np
 import pickle
-import fire
 import os
 import warnings
 from transformers import AutoModelForCausalLM, AutoTokenizer, LlamaConfig # Example config import
 from typing import Dict, List, Tuple
+import pyprojroot
+import sys
+root = pyprojroot.find_root(pyprojroot.has_dir("src"))
+sys.path.append(str(root))
 
-from src.peft_model import get_peft_model
-from src.lora import LoraConfig
-from src.utils import apply_global_structural_mask, get_model_config
+from src.latency_profiling.peft_model import get_peft_model
+from src.latency_profiling.lora import LoraConfig
+from src.latency_profiling.utils import apply_global_structural_mask, get_model_config
 
 # --- Configuration ---
 DEFAULT_BASE_MODEL = "baffo32/decapoda-research-llama-7B-hf" 
 DEFAULT_LORA_R = 8 # LoRA rank (doesn't affect latency much if merged, but needed for setup)
 DEFAULT_LORA_ALPHA = 16
+DEFAULT_LORA_DROPOUT = 0
 DEFAULT_LORA_TARGET_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
-DEFAULT_BATCH_SIZE = 1 # Profile latency for batch size 1 typically
+DEFAULT_BATCH_SIZE = 16 # Profile latency for batch size 1 typically
 DEFAULT_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 WARMUP_RUNS = 10
-MEASUREMENT_RUNS = 20 # Number of runs to average for latency
+MEASUREMENT_RUNS = 10 # Number of runs to average for latency
+DEVICE_NAME = torch.cuda.get_device_name(0) if DEFAULT_DEVICE == "cuda" else "cpu" # fill in device name if not using cuda enable device
 
 # --- Profiling Ranges ---
 # Sequence lengths to profile
-SEQ_LENS_TO_PROFILE = [128, 256, 512, 1024, 2048]
+SEQ_LENS_TO_PROFILE = [128, 256, 384, 512, 768, 1024, 2048]
 # Number of *active* attention heads to profile (from min to max)
 # Will depend on the specific model's total heads
 HEAD_COUNTS_TO_PROFILE = None # Will be set dynamically based on model config
@@ -40,7 +47,7 @@ def measure_latency(model, dummy_input, device):
     # Use CUDA events for accurate GPU timing
     if device == "cuda":
         starter, ender = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-
+        dummy_input = dummy_input.to(device)
         # Warmup runs
         for _ in range(WARMUP_RUNS):
             _ = model(dummy_input)
@@ -71,6 +78,7 @@ def measure_latency(model, dummy_input, device):
 
 def generate_dummy_input(batch_size, seq_len, vocab_size, device):
     """Generates random token IDs as dummy input."""
+    print(f"loading dummy input to deivice {device}")
     return torch.randint(0, vocab_size, (batch_size, seq_len), device=device)
 
 # --- Main Profiling Function ---
@@ -79,11 +87,12 @@ def build_latency_table(
     base_model: str = DEFAULT_BASE_MODEL,
     lora_r: int = DEFAULT_LORA_R,
     lora_alpha: int = DEFAULT_LORA_ALPHA,
+    lora_dropout: float = DEFAULT_LORA_DROPOUT,
     lora_target_modules: List[str] = DEFAULT_LORA_TARGET_MODULES,
     batch_size: int = DEFAULT_BATCH_SIZE,
     device: str = DEFAULT_DEVICE,
-    output_dir: str = "latency_luts",
-    model_load_kwargs: Dict = {"torch_dtype": torch.float16, "device_map": "auto"}
+    output_dir: str = f"outputs/latency_profiling/{DEVICE_NAME.replace(' ', '_')}",
+    model_load_kwargs: Dict = {"torch_dtype": torch.float16, "device_map": "manual"}
 ):
     """
     Profiles model latency for different structural configurations and saves LUTs.
@@ -120,6 +129,7 @@ def build_latency_table(
 
     model = AutoModelForCausalLM.from_pretrained(base_model, **model_load_kwargs)
     model.eval() # Set to evaluation mode
+    print(f"model loaded to device {model.device}")
 
     # --- Get Model Config ---
     model_config = get_model_config(model)
@@ -130,12 +140,12 @@ def build_latency_table(
 
     # --- Define Profiling Ranges Dynamically ---
     # Profile from 1 head up to total heads, maybe in steps
-    head_counts_to_profile = sorted(list(set([1, 2, 4] + list(range(8, num_total_heads + 1, 8)))))
+    head_counts_to_profile = list(range(1,num_total_heads+1))
     if num_total_heads not in head_counts_to_profile: head_counts_to_profile.append(num_total_heads)
     print(f"Profiling Head Counts: {head_counts_to_profile}")
 
     # Profile FFN channels, e.g., in steps of 128 or 256 up to total
-    ffn_step = 256 # Example step size
+    ffn_step = 512 # Example step size
     ffn_counts_to_profile = sorted(list(set([ffn_step // 2] + list(range(ffn_step, num_total_ffn + 1, ffn_step)))))
     if num_total_ffn not in ffn_counts_to_profile: ffn_counts_to_profile.append(num_total_ffn)
     print(f"Profiling FFN Counts: {ffn_counts_to_profile}")
@@ -152,81 +162,62 @@ def build_latency_table(
     lora_config = LoraConfig(
         r=lora_r,
         lora_alpha=lora_alpha,
+        lora_dropout=lora_dropout,
         target_modules=lora_target_modules,
-        bias="none",
+        lora_bias="none",
         task_type="CAUSAL_LM",
     )
     # Use the PEFT function to wrap the model
     # This replaces layers with LoRA layers, which pruner_utils expects
     model = get_peft_model(model, lora_config)
+    model = model.to(device)
+    print(f"model device after applying lora {model.device}")
     print("LoRA structure applied.")
-
     # --- Initialize LUTs ---
     latency_lut = {} # Combined LUT for simplicity: key = (type, N, L, D, active_count)
 
     # --- Profiling Loop ---
-    for seq_len in SEQ_LENS_TO_PROFILE:
+    for seq_len in tqdm(SEQ_LENS_TO_PROFILE):
         print(f"\n--- Profiling for Sequence Length (L) = {seq_len} ---")
         dummy_input = generate_dummy_input(batch_size, seq_len, vocab_size, device)
 
-        # Profile different numbers of active attention heads (assuming FFN is full)
-        print(f"Profiling Attention Heads (FFN Full = {num_total_ffn})...")
-        for num_active_heads in head_counts_to_profile:
-            # Create a fresh copy or reset the model state before applying mask
-            # Easiest is to reload, but slow. Alternative: store original weights and restore.
-            # For now, we assume apply_global_structural_mask modifies in-place and
-            # we need to restore. Let's try zeroing/unzeroing.
-
-            # Store original state (simple approach: just zero/unzero)
-            # A more robust way involves deep copying weights before masking.
-            original_weights = {name: p.clone() for name, p in model.named_parameters()}
-
-            # Apply the mask: keep `num_active_heads`, keep `num_total_ffn`
-            apply_global_structural_mask(model, num_active_heads, num_total_ffn)
-
-            # Measure
-            avg_lat, std_lat = measure_latency(model, dummy_input, device)
-            key = ("attn", batch_size, seq_len, model_config['hidden_size'], num_active_heads)
-            latency_lut[key] = avg_lat
-            print(f"  Heads={num_active_heads:<4}: Latency={avg_lat:.4f} ms (std={std_lat:.4f})")
-
-            # Restore original weights
-            with torch.no_grad():
-                for name, p in model.named_parameters():
-                    if name in original_weights:
-                        p.copy_(original_weights[name])
-            del original_weights # Free memory
-            torch.cuda.empty_cache() if device == 'cuda' else None
-
-
         # Profile different numbers of active FFN channels (assuming Attention is full)
-        print(f"\nProfiling FFN Channels (Heads Full = {num_total_heads})...")
-        for num_active_ffn in ffn_counts_to_profile:
-            original_weights = {name: p.clone() for name, p in model.named_parameters()}
+        print(f"Profiling Attention Heads (FFN Full = {num_total_ffn})... \nProfiling FFN Channels (Heads Full = {num_total_heads})...")
+     
+        for num_active_heads in head_counts_to_profile:
+            for num_active_ffn in ffn_counts_to_profile:
+                
+                # Skip configurations already profiled by the loops above
+                is_attn_only_equivalent = (num_active_ffn == num_total_ffn)
+                is_ffn_only_equivalent = (num_active_heads == num_total_heads)
 
-            # Apply the mask: keep `num_total_heads`, keep `num_active_ffn`
-            apply_global_structural_mask(model, num_total_heads, num_active_ffn)
-
-            # Measure
-            avg_lat, std_lat = measure_latency(model, dummy_input, device)
-            key = ("ffn", batch_size, seq_len, model_config['hidden_size'], num_active_ffn)
-            latency_lut[key] = avg_lat
-            print(f"  FFN={num_active_ffn:<5}: Latency={avg_lat:.4f} ms (std={std_lat:.4f})")
-
-            # Restore original weights
-            with torch.no_grad():
-                for name, p in model.named_parameters():
-                     if name in original_weights:
-                         p.copy_(original_weights[name])
-            del original_weights
-            torch.cuda.empty_cache() if device == 'cuda' else None
+                if is_attn_only_equivalent or is_ffn_only_equivalent:
+                    # These specific combinations are covered by the loops above.
+                    # The case where BOTH are full (num_total_heads, num_total_ffn) is also covered.
+                    continue
+                original_weights = {name: p.clone() for name, p in model.named_parameters()}
+                # ... (store original_weights) ...
+                apply_global_structural_mask(model, num_active_heads, num_active_ffn)
+                avg_lat, std_lat = measure_latency(model, dummy_input, device)
+                key = (batch_size, seq_len, model_config['hidden_size'], num_active_heads, num_active_ffn)
+                latency_lut[key] = (avg_lat,std_lat)
+                print(f"  Config: Heads={num_active_heads:<4}, FFN={num_active_ffn:<5} : Latency={avg_lat:.4f} ms (std={std_lat:.4f})")
+                
+                # Restore original weights
+                with torch.no_grad():
+                    for name, p in model.named_parameters():
+                        if name in original_weights:
+                            p.copy_(original_weights[name])
+                del original_weights
+                torch.cuda.empty_cache() if device == 'cuda' else None
 
 
     # --- Save LUT ---
     os.makedirs(output_dir, exist_ok=True)
     # Sanitize base_model name for filename
     safe_model_name = base_model.split('/')[-1].replace('-', '_')
-    lut_filename = os.path.join(output_dir, f"latency_lut_{safe_model_name}_N{batch_size}.pkl")
+
+    lut_filename = os.path.join(output_dir, f"{safe_model_name}.pkl")
     try:
         with open(lut_filename, "wb") as f:
             pickle.dump(latency_lut, f)
@@ -234,10 +225,32 @@ def build_latency_table(
     except Exception as e:
         print(f"\nError saving LUT to {lut_filename}: {e}")
 
+    configs = {
+        "base_model": base_model,
+        "lora_r": lora_r,
+        "lora_alpha": lora_alpha,
+        "lora_dropout": lora_dropout,
+        "lora_target_modules": lora_target_modules,
+        "batch_size": batch_size,
+        "device": device,
+        "device_name": DEVICE_NAME,
+        "seq_lens_to_profile": SEQ_LENS_TO_PROFILE,
+        "head_counts_to_profile": head_counts_to_profile,
+        "ffn_counts_to_profile": ffn_counts_to_profile
+    }
+    # Save the configs used for profiling
+    config_filename = os.path.join(output_dir, f"config.json")
+    try:
+        with open(config_filename, "w") as f:
+            json.dump(configs, f, indent=4)
+        print(f"Configuration saved to: {config_filename}")
+    except Exception as e:
+        print(f"Error saving config to {config_filename}: {e}")
+
     print("--- Profiling Complete ---")
 
 
 if __name__ == "__main__":
     # Example usage:
     # python -m latency_profiling.build_latency_lut --base_model="meta-llama/Llama-2-7b-hf" --output_dir="latency_luts"
-    fire.Fire(build_latency_table)
+    build_latency_table()

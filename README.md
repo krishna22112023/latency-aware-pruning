@@ -15,8 +15,15 @@ DiLAP is a framework for hardware-aware structured pruning of deep neural networ
 
 ## TO DO
 
+Stage 0 : Create a latency table for structured pruning
+There should be three groups : 
+1. 'self_attn': ['q_proj', 'k_proj', 'v_proj', 'o_proj'] : Prune by number of heads, need_prune_num = int(num_heads * ratio). where ratio is randomly generated between [0,1]. Zero out the heads in q,k,v. Perform one linear pass, then zero out o_proj.
+2. 'mlp': ['up_proj', 'gate_proj'] : Prune by remaining output channels need_prune_num = int(out_features * 0.1). Zero out those channels in both up_proj & gate_proj.
+3. 'blocks' : ['o_proj', 'down_proj']
+These are handled entirely in the final weight‐shrinking step (apply_global_structural_mask) and not by apply_global_structural_layer itself—so you never apply the ratio or target_ratio logic here.
+
+
 Stage 1 : Pruning to compare with SOTA pruning methods
-- [ ] Construct latency dataset for H100
 - [ ] SOTA Methods include : 
     1. Magnitude only
     2. LLM-Streamline (2024)

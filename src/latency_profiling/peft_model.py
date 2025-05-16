@@ -5,7 +5,7 @@ from accelerate import dispatch_model, infer_auto_device_map
 from accelerate.hooks import AlignDevicesHook, add_hook_to_module, remove_hook_from_submodules
 from accelerate.utils import get_balanced_memory
 from huggingface_hub import hf_hub_download
-from .lora import LoraModel
+from src.latency_profiling.lora import LoraModel
 import torch
 import os
 WEIGHTS_NAME = "adapter_model.bin"

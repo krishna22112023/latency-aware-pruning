@@ -30,14 +30,8 @@ from peft import LoftQConfig, LoraRuntimeConfig
 from peft.utils import PeftType, transpose
 from peft import PeftConfig
 
-
-def is_bnb_available():
-    return importlib.util.find_spec("bitsandbytes") is not None
-
-
-if is_bnb_available():
-    import bitsandbytes as bnb
-    from bitsandbytes.nn.modules import Int8Params
+#import bitsandbytes as bnb
+#from bitsandbytes.nn.modules import Int8Params
 
 
 @dataclass
@@ -54,7 +48,7 @@ class LoraConfig(PeftConfig):
             Whether to merge the weights of the Lora layers with the base transformer model in `eval` mode.
         fan_in_fan_out (`bool`): Set this to True if the layer to replace stores weight like (fan_in, fan_out)
         enable_lora ( `List[bool]`): Used with `lora.MergedLinear`.
-        bias (`str`): Bias type for Lora. Can be 'none', 'all' or 'lora_only'
+        lora_bias (`str`): Bias type for Lora. Can be 'none', 'all' or 'lora_only'
         modules_to_save (`List[str]`):List of modules apart from LoRA layers to be set as trainable
             and saved in the final checkpoint.
     """
@@ -77,7 +71,8 @@ class LoraConfig(PeftConfig):
         metadata={"help": "Set this to True if the layer to replace stores weight like (fan_in, fan_out)"},
     )
     enable_lora: Optional[List[bool]] = field(default=None, metadata={"help": "Used with `lora.MergedLinear`."})
-    bias: str = field(default="none", metadata={"help": "Bias type for Lora. Can be 'none', 'all' or 'lora_only'"})
+    lora_bias: str = field(default="none", metadata={"help": "Bias type for Lora. Can be 'none', 'all' or 'lora_only'"})
+    bias: str = field(default="none", metadata={"help": "Bias"})
     modules_to_save: Optional[List[str]] = field(
         default=None,
         metadata={
@@ -304,16 +299,16 @@ class LoraModel(torch.nn.Module):
         self.peft_config = config
         self.model = model
         self._find_and_replace()
-        mark_only_lora_as_trainable(self.model, self.peft_config.bias)
+        mark_only_lora_as_trainable(self.model, self.peft_config.lora_bias)
         self.forward = self.model.forward
 
     def _find_and_replace(self):
-        loaded_in_8bit = getattr(self.model, "is_loaded_in_8bit", False)
+        '''loaded_in_8bit = getattr(self.model, "is_loaded_in_8bit", False)
         if loaded_in_8bit and not is_bnb_available():
             raise ImportError(
                 "To use Lora with 8-bit quantization, please install the `bitsandbytes` package. "
                 "You can install it with `pip install bitsandbytes`."
-            )
+            )'''
         is_target_modules_in_base_model = False
         kwargs = {
             "r": self.peft_config.r,
@@ -333,7 +328,7 @@ class LoraModel(torch.nn.Module):
                     is_target_modules_in_base_model = True
                 parent, target, target_name = self._get_submodules(key)
                 bias = target.bias is not None
-                if loaded_in_8bit and isinstance(target, bnb.nn.Linear8bitLt):
+                '''if loaded_in_8bit and isinstance(target, bnb.nn.Linear8bitLt):
                     kwargs.update(
                         {
                             "has_fp16_weights": target.state.has_fp16_weights,
@@ -346,8 +341,8 @@ class LoraModel(torch.nn.Module):
                         new_module = Linear8bitLt(target.in_features, target.out_features, bias=bias, **kwargs)
                     else:
                         kwargs.update({"enable_lora": self.peft_config.enable_lora})
-                        new_module = MergedLinear8bitLt(target.in_features, target.out_features, bias=bias, **kwargs)
-                elif isinstance(target, peft.tuners.lora.layer.Linear) and self.peft_config.enable_lora is None:
+                        new_module = MergedLinear8bitLt(target.in_features, target.out_features, bias=bias, **kwargs)'''
+                if isinstance(target, peft.tuners.lora.layer.Linear) and self.peft_config.enable_lora is None:
                     new_module = Linear(target.in_features, target.out_features, bias=bias, **kwargs)
                 elif self.peft_config.enable_lora is not None:
                     kwargs.update({"enable_lora": self.peft_config.enable_lora})
@@ -549,63 +544,61 @@ class Linear(nn.Linear, LoraLayer):
         return result
 
 
-if is_bnb_available():
-
-    class Linear8bitLt(bnb.nn.Linear8bitLt, LoraLayer):
-        # Lora implemented in a dense layer
-        def __init__(
+'''class Linear8bitLt(bnb.nn.Linear8bitLt, LoraLayer):
+    # Lora implemented in a dense layer
+    def __init__(
+        self,
+        in_features,
+        out_features,
+        r: int = 0,
+        lora_alpha: int = 1,
+        lora_dropout: float = 0.0,
+        **kwargs,
+    ):
+        bnb.nn.Linear8bitLt.__init__(
             self,
             in_features,
             out_features,
-            r: int = 0,
-            lora_alpha: int = 1,
-            lora_dropout: float = 0.0,
-            **kwargs,
-        ):
-            bnb.nn.Linear8bitLt.__init__(
-                self,
-                in_features,
-                out_features,
-                bias=kwargs.get("bias", True),
-                has_fp16_weights=kwargs.get("has_fp16_weights", True),
-                memory_efficient_backward=kwargs.get("memory_efficient_backward", False),
-                threshold=kwargs.get("threshold", 0.0),
-                index=kwargs.get("index", None),
-            )
-            LoraLayer.__init__(self, r=r, lora_alpha=lora_alpha, lora_dropout=lora_dropout, merge_weights=False)
-            # Actual trainable parameters
-            if r > 0:
-                self.lora_A = nn.Linear(in_features, r, bias=False)
-                self.lora_B = nn.Linear(r, out_features, bias=False)
-                self.scaling = self.lora_alpha / self.r
-                # Freezing the pre-trained weight matrix
-                self.weight.requires_grad = False
-                self.lora_mask = nn.Parameter(torch.ones(out_features), requires_grad=False)
-                self.is_prune = True
-            self.reset_parameters()
+            bias=kwargs.get("bias", True),
+            has_fp16_weights=kwargs.get("has_fp16_weights", True),
+            memory_efficient_backward=kwargs.get("memory_efficient_backward", False),
+            threshold=kwargs.get("threshold", 0.0),
+            index=kwargs.get("index", None),
+        )
+        LoraLayer.__init__(self, r=r, lora_alpha=lora_alpha, lora_dropout=lora_dropout, merge_weights=False)
+        # Actual trainable parameters
+        if r > 0:
+            self.lora_A = nn.Linear(in_features, r, bias=False)
+            self.lora_B = nn.Linear(r, out_features, bias=False)
+            self.scaling = self.lora_alpha / self.r
+            # Freezing the pre-trained weight matrix
+            self.weight.requires_grad = False
+            self.lora_mask = nn.Parameter(torch.ones(out_features), requires_grad=False)
+            self.is_prune = True
+        self.reset_parameters()
 
-        def reset_parameters(self):
-            if hasattr(self, "lora_A"):
-                # initialize A the same way as the default for nn.Linear and B to zero
-                nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5))
-                nn.init.zeros_(self.lora_B.weight)
+    def reset_parameters(self):
+        if hasattr(self, "lora_A"):
+            # initialize A the same way as the default for nn.Linear and B to zero
+            nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5))
+            nn.init.zeros_(self.lora_B.weight)
 
-        def forward(self, x: torch.Tensor):
-            result = super().forward(x)
-            # mask = (self.weight.data != 0).to(dtype=self.lora_A.weight.data.dtype)
-            if self.disable_adapters:
-                return result
-            elif self.r > 0:
-                if not torch.is_autocast_enabled():
-                    expected_dtype = result.dtype
-
-                    if x.dtype != torch.float32:
-                        x = x.float()
-                    output = self.lora_B(self.lora_A(self.lora_dropout(x))).to(expected_dtype) * self.scaling
-                    result += output
-                else:
-                    output = self.lora_B(self.lora_A(self.lora_dropout(x))) * self.scaling
-                    result += output
-            if hasattr(self, 'lora_mask'):
-                result *= self.lora_mask.reshape(1, 1, -1)
+    def forward(self, x: torch.Tensor):
+        result = super().forward(x)
+        # mask = (self.weight.data != 0).to(dtype=self.lora_A.weight.data.dtype)
+        if self.disable_adapters:
             return result
+        elif self.r > 0:
+            if not torch.is_autocast_enabled():
+                expected_dtype = result.dtype
+
+                if x.dtype != torch.float32:
+                    x = x.float()
+                output = self.lora_B(self.lora_A(self.lora_dropout(x))).to(expected_dtype) * self.scaling
+                result += output
+            else:
+                output = self.lora_B(self.lora_A(self.lora_dropout(x))) * self.scaling
+                result += output
+        if hasattr(self, 'lora_mask'):
+            result *= self.lora_mask.reshape(1, 1, -1)
+        return result'''

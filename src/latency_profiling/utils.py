@@ -3,17 +3,19 @@ import torch
 import torch.nn as nn
 import numpy as np
 import warnings
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
+
+from transformers import AutoTokenizer
+
 
 # Assuming lora.py is accessible, e.g., from parent dir or installed package
 # Adjust import path as needed
 try:
-    from loraprune.lora import Linear, Linear8bitLt
+    from src.latency_profiling.lora import Linear
 except ImportError:
     warnings.warn("Could not import LoRA layers. Ensure loraprune package is installed or path is correct.")
     # Define dummy classes if import fails, to allow script structure to work
     class Linear(nn.Linear): pass
-    class Linear8bitLt: pass # Placeholder
 
 # Define structural groups (consistent with LoRAPrune)
 # NUM_ATTENTION_HEADS needs to be set based on the specific model config
@@ -41,7 +43,7 @@ def get_model_config(model):
 
 def _is_target_lora_layer(module):
     """Checks if a module is a LoRA layer we might prune (structurally)."""
-    return isinstance(module, (Linear, Linear8bitLt)) and hasattr(module, 'lora_A')
+    return isinstance(module, Linear) and hasattr(module, 'lora_A')
 
 def get_layer_name_and_type(module_name: str, model_config: Dict) -> Tuple[Optional[int], Optional[str], Optional[str]]:
     """ Extracts layer index, type (attn/mlp), and projection type from module name. """
@@ -63,7 +65,7 @@ def get_layer_name_and_type(module_name: str, model_config: Dict) -> Tuple[Optio
 
 
 def apply_structural_mask_to_layer(
-    module: Union[Linear, Linear8bitLt],
+    module: Union[Linear],
     mask: torch.Tensor,
     group_type: str,
     proj_type: str,
@@ -204,4 +206,57 @@ def apply_global_structural_mask(model, num_active_heads: int, num_active_ffn: i
             apply_structural_mask_to_layer(module, head_mask, group_type, proj_type, head_dim, num_total_heads)
         elif group_type == 'ffn_channel':
             apply_structural_mask_to_layer(module, ffn_mask, group_type, proj_type, head_dim, num_total_heads)
+
+def tokenize(tokenizer, prompt, add_eos_token=True, cutoff_len=256):
+    # there's probably a way to do this with the tokenizer settings
+    # but again, gotta move fast
+    result = tokenizer(
+        prompt,
+        truncation=True,
+        max_length=cutoff_len,
+        padding=False,
+        return_tensors=None,
+    )
+    if (
+        result["input_ids"][-1] != tokenizer.eos_token_id
+        and len(result["input_ids"]) < cutoff_len
+        and add_eos_token
+    ):
+        result["input_ids"].append(tokenizer.eos_token_id)
+        result["attention_mask"].append(1)
+
+    result["labels"] = result["input_ids"].copy()
+
+    return result
+
+def generate_prompt(data_point):
+    return f"""Below is an instruction that describes a task. Write a response that appropriately completes the request.
+
+            ### Instruction:
+            {data_point["instruction"]}
+
+            ### Response:
+            {data_point["response"]}"""
+
+def generate_and_tokenize_prompt(data_point):
+    # if train_on_inputs False, masks out inputs in loss
+    train_on_inputs=False
+    base_model = "baffo32/decapoda-research-llama-7B-hf"
+    tokenizer = AutoTokenizer.from_pretrained(base_model)
+    tokenizer.pad_token_id = (0)  # unk. we want this to be different from the eos token
+    tokenizer.padding_side = "left"  # Allow batched inference
+
+    full_prompt = generate_prompt(data_point)
+    tokenized_full_prompt = tokenize(full_prompt,tokenizer)
+    if not train_on_inputs:
+        user_prompt = generate_prompt({**data_point, "response": ""})
+        tokenized_user_prompt = tokenize(user_prompt, add_eos_token=False)
+        user_prompt_len = len(tokenized_user_prompt["input_ids"])
+
+        tokenized_full_prompt["labels"] = [
+            -100
+        ] * user_prompt_len + tokenized_full_prompt["labels"][
+            user_prompt_len:
+        ]  # could be sped up, probably
+    return tokenized_full_prompt
 
