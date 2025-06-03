@@ -17,7 +17,7 @@ import fire
 import torch
 import transformers
 from datasets import load_dataset
-from transformers import AutoTokenizer, AutoModelForCausalLM, TrainingArguments
+from transformers import LlamaTokenizer, AutoModelForCausalLM, TrainingArguments, AutoTokenizer
 from peft import prepare_model_for_kbit_training
 
 from src.latency_profiling.lora import LoraConfig
@@ -39,7 +39,11 @@ def setup_model_and_tokenizer(config: LatencyAwareConfig):
     """Setup model and tokenizer with LoRA"""
     
     # Load tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(config.base_model)
+    if 'llama' in config.base_model:
+        tokenizer = LlamaTokenizer.from_pretrained(config.base_model, legacy=False, trust_remote_code=True)
+    else:
+        tokenizer = AutoTokenizer.from_pretrained(config.base_model, trust_remote_code=True)
+    logger.info(f"Tokenizer loaded {tokenizer}")
     tokenizer.pad_token_id = 0  # unk token
     tokenizer.padding_side = "left"
     
@@ -245,8 +249,8 @@ def run_latency_aware_pruning(
         save_steps=200,
         save_total_limit=3,
         load_best_model_at_end=False,
-        report_to="wandb" if wandb_project else None,
-        run_name=wandb_run_name if wandb_project else None,
+        report_to="wandb",
+        run_name=wandb_run_name,
         dataloader_drop_last=True,
     )
     
