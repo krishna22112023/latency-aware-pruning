@@ -7,11 +7,7 @@ import logging
 import warnings
 from datetime import datetime
 from typing import List
-
-# Add project root to path
-import pyprojroot
-root_path = pyprojroot.find_root(pyprojroot.has_dir("config"))
-sys.path.append(root_path)
+from functools import partial
 
 import fire
 import torch
@@ -19,6 +15,11 @@ import transformers
 from datasets import load_dataset
 from transformers import LlamaTokenizer, AutoModelForCausalLM, TrainingArguments, AutoTokenizer
 from peft import prepare_model_for_kbit_training
+
+# Add project root to path
+import pyprojroot
+root_path = pyprojroot.find_root(pyprojroot.has_dir("config"))
+sys.path.append(str(root_path))
 
 from src.latency_profiling.lora import LoraConfig
 from src.latency_profiling.peft_model import get_peft_model
@@ -39,11 +40,8 @@ def setup_model_and_tokenizer(config: LatencyAwareConfig):
     """Setup model and tokenizer with LoRA"""
     
     # Load tokenizer
-    if 'llama' in config.base_model:
-        tokenizer = LlamaTokenizer.from_pretrained(config.base_model, legacy=False, trust_remote_code=True)
-    else:
-        tokenizer = AutoTokenizer.from_pretrained(config.base_model, trust_remote_code=True)
-    logger.info(f"Tokenizer loaded {tokenizer}")
+    tokenizer = AutoTokenizer.from_pretrained(config.base_model, trust_remote_code=True)
+    logger.info(f"Tokenizer loaded from {config.base_model}")
     tokenizer.pad_token_id = 0  # unk token
     tokenizer.padding_side = "left"
     
@@ -58,10 +56,12 @@ def setup_model_and_tokenizer(config: LatencyAwareConfig):
     
     model = AutoModelForCausalLM.from_pretrained(config.base_model, **model_kwargs)
     model = model.to(config.device)
+    logger.info(f"Model loaded from {config.base_model}")
     
     # Prepare for k-bit training if needed
     if config.load_in_8bit:
         model = prepare_model_for_kbit_training(model)
+        logger.info("Model prepared for 8-bit training")
     
     # Setup LoRA configuration
     lora_config = LoraConfig(
@@ -101,19 +101,20 @@ def setup_dataset(config: LatencyAwareConfig, tokenizer):
     else:
         data = load_dataset(config.data_path)
     
-    # Create tokenization function
-    def tokenize_function(examples):
-        return generate_and_tokenize_prompt(examples)
-    
+    tokenize_fn = partial(
+        generate_and_tokenize_prompt,
+        tokenizer=tokenizer,
+        train_on_inputs=config.train_on_inputs
+    )
     # Split data if validation set is requested
     if config.val_set_size > 0:
         train_val = data["train"].train_test_split(
             test_size=config.val_set_size, shuffle=True, seed=42
         )
-        train_data = train_val["train"].shuffle().map(tokenize_function)
-        val_data = train_val["test"].shuffle().map(tokenize_function)
+        train_data = train_val["train"].map(tokenize_fn, batched=True, num_proc=4,remove_columns=train_val["train"].column_names, batch_size=config.tokenizer_batch_size,desc="tokenizing training data")
+        val_data = train_val["test"].map(tokenize_fn, batched=True, num_proc=4, remove_columns=train_val["test"].column_names, batch_size=config.tokenizer_batch_size, desc="tokenizing validation data")
     else:
-        train_data = data["train"].shuffle().map(tokenize_function)
+        train_data = data["train"].map(tokenize_fn, batched=True, num_proc=4, remove_columns=data["train"].column_names, batch_size=config.tokenizer_batch_size, desc="tokenizing training data")
         val_data = None
     
     return train_data, val_data
@@ -154,7 +155,7 @@ def run_latency_aware_pruning(
     device = "cuda" if torch.cuda.is_available() else "cpu",
     
     # Latency settings
-    latency_lut_path: str = "outputs/latency_profiling/",
+    latency_lut_path: str = "outputs/latency_profiling/NVIDIA_H100_80GB_HBM3",
     
     # Logging
     wandb_run_name: str = f"run_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}",
@@ -209,12 +210,17 @@ def run_latency_aware_pruning(
     logger.info(f"  Output directory: {config.output_dir}")
     
     # Setup model and tokenizer
-    logger.info("Setting up model and tokenizer...")
+    logger.info("Setting up model and tokenizer")
     model, tokenizer = setup_model_and_tokenizer(config)
+    logger.info(f"model and tokenizer setup complete.")
     
     # Setup dataset
     logger.info("Setting up dataset...")
-    train_data, val_data = setup_dataset(config, tokenizer)
+    train_data, val_data = setup_dataset(config,tokenizer)
+    logger.info("Dataset setup complete.")
+    logger.info(f"Training data size: {len(train_data)}")
+    if val_data:
+        logger.info(f"Validation data size: {len(val_data)}")
     
     # Get model configuration
     model_config = {
@@ -243,7 +249,7 @@ def run_latency_aware_pruning(
         learning_rate=config.learning_rate,
         fp16=True,
         logging_steps=10,
-        evaluation_strategy="steps" if val_data else "no",
+        eval_strategy="steps" if val_data else "no",
         eval_steps=100 if val_data else None,
         save_strategy="steps",
         save_steps=200,
@@ -253,10 +259,15 @@ def run_latency_aware_pruning(
         run_name=wandb_run_name,
         dataloader_drop_last=True,
     )
-    
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.pad_token_id = tokenizer.eos_token_id
     # Create data collator
-    data_collator = transformers.DataCollatorForSeq2Seq(
-        tokenizer, pad_to_multiple_of=8, return_tensors="pt", padding=True
+    data_collator = transformers.DataCollatorForLanguageModeling(
+        tokenizer=tokenizer, 
+        mlm=False,
+        pad_to_multiple_of=8,
+        return_tensors="pt"
     )
     
     # Create trainer

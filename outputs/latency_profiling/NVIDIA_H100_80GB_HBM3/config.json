@@ -1,5 +1,5 @@
 {
-    "base_model": "baffo32/decapoda-research-llama-7B-hf",
+    "base_model": "meta-llama/Llama-3.2-1B",
     "lora_r": 8,
     "lora_alpha": 16,
     "lora_dropout": 0,
@@ -12,7 +12,7 @@
         "up_proj",
         "down_proj"
     ],
-    "batch_size": 16,
+    "batch_size": 1,
     "device": "cuda",
     "device_name": "NVIDIA H100 80GB HBM3",
     "seq_lens_to_profile": [
@@ -75,12 +75,6 @@
         6656,
         7168,
         7680,
-        8192,
-        8704,
-        9216,
-        9728,
-        10240,
-        10752,
-        11008
+        8192
     ]
 }

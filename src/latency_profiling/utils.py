@@ -238,25 +238,16 @@ def generate_prompt(data_point):
             ### Response:
             {data_point["response"]}"""
 
-def generate_and_tokenize_prompt(data_point):
-    # if train_on_inputs False, masks out inputs in loss
-    train_on_inputs=False
-    base_model = "baffo32/decapoda-research-llama-7B-hf"
-    tokenizer = AutoTokenizer.from_pretrained(base_model)
-    tokenizer.pad_token_id = (0)  # unk. we want this to be different from the eos token
-    tokenizer.padding_side = "left"  # Allow batched inference
+def generate_and_tokenize_prompt(data_point,tokenizer, train_on_inputs=False):
 
     full_prompt = generate_prompt(data_point)
-    tokenized_full_prompt = tokenize(full_prompt,tokenizer)
+    tokenized_full_prompt = tokenize(tokenizer,full_prompt)
     if not train_on_inputs:
         user_prompt = generate_prompt({**data_point, "response": ""})
-        tokenized_user_prompt = tokenize(user_prompt, add_eos_token=False)
+        tokenized_user_prompt = tokenize(tokenizer,user_prompt, add_eos_token=False)
         user_prompt_len = len(tokenized_user_prompt["input_ids"])
 
-        tokenized_full_prompt["labels"] = [
-            -100
-        ] * user_prompt_len + tokenized_full_prompt["labels"][
-            user_prompt_len:
-        ]  # could be sped up, probably
+        tokenized_full_prompt["labels"] = ([-100] * user_prompt_len + tokenized_full_prompt["labels"][user_prompt_len:])  # could be sped up, probably
     return tokenized_full_prompt
+        
 

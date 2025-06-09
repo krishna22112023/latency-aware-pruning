@@ -29,6 +29,8 @@ class LatencyAwareTrainer(Trainer):
         super().__init__(**kwargs)
         
         self.config = config
+        self.args = kwargs.get('args')
+        self.train_dataset = kwargs.get('train_dataset')
         self.mask_manager = mask_manager
         self.latency_estimator = latency_estimator
         
@@ -47,7 +49,9 @@ class LatencyAwareTrainer(Trainer):
         self.sparsity_history = []
 
         self.use_apex = APEX_AVAILABLE
-    
+
+        self.max_steps = (len(self.train_dataset) / config.micro_batch_size) * config.num_epochs
+
     def compute_loss(self, model, inputs, return_outputs=False):
         """
         Compute the complete loss function with latency penalty
@@ -70,7 +74,7 @@ class LatencyAwareTrainer(Trainer):
         
         return (total_loss, outputs) if return_outputs else total_loss
     
-    def training_step(self, model: nn.Module, inputs: Dict[str, torch.Tensor]) -> torch.Tensor:
+    def training_step(self, model: nn.Module, inputs: Dict[str, torch.Tensor], num_items_in_batch: Optional[int] = None) -> torch.Tensor:
         """
         Enhanced training step with alternating LoRA and mask updates
         """
@@ -80,7 +84,7 @@ class LatencyAwareTrainer(Trainer):
         # 1. Compute current sparsity from schedule
         self.current_sparsity = compute_schedule_sparsity(
             self.state.global_step,
-            self.state.max_steps,
+            self.max_steps,
             self.config.initial_sparsity,
             self.config.target_sparsity,
             self.config.warmup_ratio,
@@ -114,21 +118,7 @@ class LatencyAwareTrainer(Trainer):
         """
         Override the main training loop to add mask update logic
         """
-        # Store original method for mask updates
-        original_optimizer_step = self.optimizer.step
-        
-        def enhanced_optimizer_step():
-            # Standard LoRA parameter update
-            original_optimizer_step()
-            
-            # Update importance scores and mask scores
-            if self.state.global_step % self.config.prune_freq == 0:
-                self._update_mask_scores()
-        
-        # Replace optimizer step
-        self.optimizer.step = enhanced_optimizer_step
-        
-        # Call parent training loop
+        # Call parent training loop first to initialize everything
         result = super()._inner_training_loop(
             batch_size=batch_size,
             args=args,
@@ -137,10 +127,18 @@ class LatencyAwareTrainer(Trainer):
             ignore_keys_for_eval=ignore_keys_for_eval
         )
         
-        # Restore original optimizer step
-        self.optimizer.step = original_optimizer_step
-        
         return result
+    
+    def optimizer_step(self, optimizer):
+        """
+        Override optimizer step to add mask score updates
+        """
+        # Standard optimizer step
+        super().optimizer_step(optimizer)
+        
+        # Update importance scores and mask scores
+        if self.state.global_step % self.config.prune_freq == 0:
+            self._update_mask_scores()
     
     def _update_mask_scores(self):
         """Update mask scores using adaptive learning rates (Eq. 10)"""

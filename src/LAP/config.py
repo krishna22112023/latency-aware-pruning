@@ -7,7 +7,7 @@ class LatencyAwareConfig:
     """Configuration for latency-aware structured pruning with LoRA"""
     
     # Model settings
-    base_model: str = "baffo32/decapoda-research-llama-7B-hf"
+    base_model: str = "meta-llama/Llama-3.2-1B"
     lora_r: int = 8
     lora_alpha: int = 16
     lora_dropout: float = 0.0
@@ -26,7 +26,7 @@ class LatencyAwareConfig:
     # Latency-aware settings
     latency_weight: float = 0.1  # λ parameter in loss function
     regularization_weight: float = 0.01  # γ parameter
-    latency_lut_path: str = "outputs/latency_profiling/"
+    latency_lut_path: str = "outputs/latency_profiling/NVIDIA_H100_80GB_HBM3/"
     
     # Mask update settings
     mask_lr: float = 0.001  # α parameter for base learning rate
@@ -50,6 +50,7 @@ class LatencyAwareConfig:
     output_dir: str = "output_latency_aware"
     val_set_size: int = 2000
     train_on_inputs: bool = False
+    tokenizer_batch_size: int = 32
     
     # Logging
     wandb_project: str = "latency_aware_pruning"

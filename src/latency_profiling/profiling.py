@@ -18,12 +18,12 @@ from src.latency_profiling.lora import LoraConfig
 from src.latency_profiling.utils import apply_global_structural_mask, get_model_config
 
 # --- Configuration ---
-DEFAULT_BASE_MODEL = "baffo32/decapoda-research-llama-7B-hf" 
+DEFAULT_BASE_MODEL = "meta-llama/Llama-3.2-1B" 
 DEFAULT_LORA_R = 8 # LoRA rank (doesn't affect latency much if merged, but needed for setup)
 DEFAULT_LORA_ALPHA = 16
 DEFAULT_LORA_DROPOUT = 0
 DEFAULT_LORA_TARGET_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
-DEFAULT_BATCH_SIZE = 16 # Profile latency for batch size 1 typically
+DEFAULT_BATCH_SIZE = 1 # Profile latency for batch size 1 typically
 DEFAULT_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 WARMUP_RUNS = 10
 MEASUREMENT_RUNS = 10 # Number of runs to average for latency
@@ -252,5 +252,5 @@ def build_latency_table(
 
 if __name__ == "__main__":
     # Example usage:
-    # python -m latency_profiling.build_latency_lut --base_model="meta-llama/Llama-2-7b-hf" --output_dir="latency_luts"
+    # python -m latency_profiling.profiling --base_model="meta-llama/Llama-2-7b-hf" --output_dir="latency_luts"
     build_latency_table()

@@ -20,9 +20,7 @@ class LatencyEstimator:
         """Load the latency lookup table from profiling results"""
         # Try different possible paths and filenames
         possible_files = [
-            os.path.join(lut_path, "decapoda_research_llama_7B_hf.pkl"),
-            os.path.join(lut_path, "latency_lut.pkl"),
-            os.path.join(lut_path, "latency_table.pkl"),
+            os.path.join(lut_path, "Llama_3.2_1B.pkl"),
         ]
         
         loaded = False

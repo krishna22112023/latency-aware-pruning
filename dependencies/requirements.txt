@@ -13,3 +13,4 @@ fire
 datasets
 pyprojroot
 bitsandbytes
+wandb
