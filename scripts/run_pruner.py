@@ -5,6 +5,7 @@ Main script for latency-aware LoRA pruning
 import sys
 import logging
 import warnings
+import wandb
 from datetime import datetime
 from typing import List
 from functools import partial
@@ -27,9 +28,9 @@ from src.latency_profiling.utils import generate_and_tokenize_prompt
 
 # Import components for latency aware pruning
 from src.LAP.config import LatencyAwareConfig
-from src.LAP.mask_manager import LatencyAwareMaskManager
-from src.LAP.latency_estimator import LatencyEstimator
-from src.LAP.trainer import LatencyAwareTrainer
+from src.LAP.mask_manager import DifferentiableMaskManager
+from src.LAP.latency_estimator import DifferentiableLatencyEstimator
+from src.LAP.trainer import DifferentiableLatencyAwareTrainer
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -42,20 +43,27 @@ def setup_model_and_tokenizer(config: LatencyAwareConfig):
     # Load tokenizer
     tokenizer = AutoTokenizer.from_pretrained(config.base_model, trust_remote_code=True)
     logger.info(f"Tokenizer loaded from {config.base_model}")
-    tokenizer.pad_token_id = 0  # unk token
-    tokenizer.padding_side = "left"
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+
+    tokenizer.padding_side = "left"  
     
     # Load model
     model_kwargs = {
         "torch_dtype": torch.bfloat16,
-        "device_map": "auto" if not config.load_in_8bit else None,
+        "device_map": None if not config.load_in_8bit else "auto",
     }
     
     if config.load_in_8bit:
         model_kwargs["load_in_8bit"] = True
+        model_kwargs["device_map"] = "auto"
     
     model = AutoModelForCausalLM.from_pretrained(config.base_model, **model_kwargs)
-    model = model.to(config.device)
+
+    if not config.load_in_8bit:
+        model = model.to(config.device)
+    
     logger.info(f"Model loaded from {config.base_model}")
     
     # Prepare for k-bit training if needed
@@ -76,7 +84,13 @@ def setup_model_and_tokenizer(config: LatencyAwareConfig):
     
     # Apply LoRA to model
     model = get_peft_model(model, lora_config)
-    model = model.to(config.device)
+    if not config.load_in_8bit:
+        model = model.to(config.device)
+
+        # Explicitly move all LoRA parameters to the correct device
+        for name, param in model.named_parameters():
+            if param.requires_grad and param.device != torch.device(config.device):
+                param.data = param.data.to(config.device)
     
     # Freeze base model parameters
     for param in model.base_model.parameters():
@@ -86,6 +100,8 @@ def setup_model_and_tokenizer(config: LatencyAwareConfig):
     for param in model.parameters():
         if param.requires_grad:
             param.data = param.data.float()
+            if param.device != torch.device(config.device):
+                param.data = param.data.to(config.device)
     
     model.print_trainable_parameters()
     
@@ -111,10 +127,10 @@ def setup_dataset(config: LatencyAwareConfig, tokenizer):
         train_val = data["train"].train_test_split(
             test_size=config.val_set_size, shuffle=True, seed=42
         )
-        train_data = train_val["train"].map(tokenize_fn, batched=True, num_proc=4,remove_columns=train_val["train"].column_names, batch_size=config.tokenizer_batch_size,desc="tokenizing training data")
-        val_data = train_val["test"].map(tokenize_fn, batched=True, num_proc=4, remove_columns=train_val["test"].column_names, batch_size=config.tokenizer_batch_size, desc="tokenizing validation data")
+        train_data = train_val["train"].map(tokenize_fn, batched=False, num_proc=4,remove_columns=train_val["train"].column_names, batch_size=config.tokenizer_batch_size,desc="tokenizing training data")
+        val_data = train_val["test"].map(tokenize_fn, batched=False, num_proc=4, remove_columns=train_val["test"].column_names, batch_size=config.tokenizer_batch_size, desc="tokenizing validation data")
     else:
-        train_data = data["train"].map(tokenize_fn, batched=True, num_proc=4, remove_columns=data["train"].column_names, batch_size=config.tokenizer_batch_size, desc="tokenizing training data")
+        train_data = data["train"].map(tokenize_fn, batched=False, num_proc=4, remove_columns=data["train"].column_names, batch_size=config.tokenizer_batch_size, desc="tokenizing training data")
         val_data = None
     
     return train_data, val_data
@@ -152,7 +168,7 @@ def run_latency_aware_pruning(
     
     # Hardware settings
     load_in_8bit: bool = False,
-    device = "cuda" if torch.cuda.is_available() else "cpu",
+    device = "cuda:0" if torch.cuda.is_available() else "cpu",
     
     # Latency settings
     latency_lut_path: str = "outputs/latency_profiling/NVIDIA_H100_80GB_HBM3",
@@ -202,6 +218,22 @@ def run_latency_aware_pruning(
         wandb_run_name=wandb_run_name,
         device=device,
     )
+
+    wandb.init(
+        project=config.wandb_project,
+        name=wandb_run_name,
+        config={
+            "model": config.base_model,
+            "target_sparsity": config.target_sparsity,
+            "batch_size": config.batch_size,
+            "learning_rate": config.learning_rate,
+            "latency_method": config.latency_method,
+            "latency_weight": config.latency_weight,
+            "lora_r": config.lora_r,
+            "max_train_samples": getattr(config, 'max_train_samples', None),
+        },
+        tags=["latency_aware_pruning", "differentiable", config.latency_method],
+    )
     
     logger.info("Configuration:")
     logger.info(f"  Base model: {config.base_model}")
@@ -232,12 +264,12 @@ def run_latency_aware_pruning(
     
     # Initialize latency estimator
     logger.info("Initializing latency estimator...")
-    latency_estimator = LatencyEstimator(config.latency_lut_path, model_config)
+    latency_estimator = DifferentiableLatencyEstimator(config.latency_lut_path, model_config)
     latency_estimator.print_lut_stats()
     
     # Initialize mask manager
     logger.info("Initializing mask manager...")
-    mask_manager = LatencyAwareMaskManager(model, config, model_config)
+    mask_manager = DifferentiableMaskManager(model, config, model_config)
     
     # Setup training arguments
     training_args = TrainingArguments(
@@ -258,21 +290,23 @@ def run_latency_aware_pruning(
         report_to="wandb",
         run_name=wandb_run_name,
         dataloader_drop_last=True,
+        dataloader_pin_memory=False,  
+        local_rank=-1
     )
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
         tokenizer.pad_token_id = tokenizer.eos_token_id
     # Create data collator
-    data_collator = transformers.DataCollatorForLanguageModeling(
-        tokenizer=tokenizer, 
-        mlm=False,
+    data_collator = transformers.DataCollatorForSeq2Seq(
+        tokenizer=tokenizer,
+        padding=True,
         pad_to_multiple_of=8,
         return_tensors="pt"
     )
     
     # Create trainer
     logger.info("Creating trainer...")
-    trainer = LatencyAwareTrainer(
+    trainer = DifferentiableLatencyAwareTrainer(
         config=config,
         mask_manager=mask_manager,
         latency_estimator=latency_estimator,
